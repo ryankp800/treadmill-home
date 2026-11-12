@@ -27,8 +27,23 @@ public class HomeActivity extends Activity {
 
     private static final int COLUMNS = 4;
     private static final String MAINTENANCE = "Maintenance";
-    private static final String NETFLIX_PKG = "com.netflix.mediaclient";
-    private static final String CRUNCHYROLL_PKG = "com.crunchyroll.crunchyroid";
+    /**
+     * Home screen order. Each row is one service; several package names cover the official app and
+     * the Google-free alternatives that run on GlassOS (no Play Services). Anything else sorts
+     * alphabetically after these.
+     */
+    private static final String[][] STREAMING_ORDER = {
+            {"com.netflix.mediaclient"},                       // Netflix
+            {"com.google.android.youtube",                     // YouTube (official)
+                    "org.schabi.newpipe",                      // NewPipe
+                    "com.teamsmart.videomanager.tv",           // SmartTube
+                    "com.futo.platformplayer"},                // Grayjay
+            {"com.amazon.avod.thirdpartyclient",               // Prime Video (phone/tablet)
+                    "com.amazon.avod"},                        // Prime Video (Fire build)
+            {"com.hulu.plus"},                                 // Hulu
+            {"com.disney.disneyplus"},                         // Disney+ (Hulu content is moving here)
+            {"com.crunchyroll.crunchyroid"},                   // Crunchyroll
+    };
 
     private final List<Tile> tiles = new ArrayList<>();
     private TileAdapter adapter;
@@ -133,9 +148,12 @@ public class HomeActivity extends Activity {
 
     private static int rank(Tile tile) {
         String pkg = tile.info.activityInfo.packageName;
-        if (pkg.equals(NETFLIX_PKG)) return 0;
-        if (pkg.equals(CRUNCHYROLL_PKG)) return 1;
-        return 2;
+        for (int i = 0; i < STREAMING_ORDER.length; i++) {
+            for (String candidate : STREAMING_ORDER[i]) {
+                if (pkg.equals(candidate)) return i;
+            }
+        }
+        return STREAMING_ORDER.length;
     }
 
     /**
