@@ -22,7 +22,7 @@ if ($LASTEXITCODE) { throw 'aapt2 link failed' }
 # Java -> classes -> dex
 $ErrorActionPreference = 'Continue'  # native tools write warnings to stderr; exit codes are checked instead
 $sources = @(Get-ChildItem -Recurse "$app\src" -Filter *.java | ForEach-Object FullName)
-& javac --release 11 -nowarn -classpath $androidJar -d "$out\classes" $sources
+& javac --release 11 -encoding UTF-8 -nowarn -classpath $androidJar -d "$out\classes" $sources
 if ($LASTEXITCODE) { throw 'javac failed' }
 $classFiles = @(Get-ChildItem -Recurse "$out\classes" -Filter *.class | ForEach-Object FullName)
 & "$bt\d8.bat" --min-api 28 --lib $androidJar --output "$out\dex" $classFiles
