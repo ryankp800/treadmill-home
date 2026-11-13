@@ -59,7 +59,8 @@ Lessons from the 1750:
 
 - **Keep eru.** It grants iFit its USB permission for the motor board when it launches iFit at boot. With eru disabled, iFit sat on its splash screen ("Requesting USB Permissions") after a restart and the belt could not run.
 - **Uninstall iFit's launcher, don't just disable it.** While `com.ifit.launcher` is enabled, eru's KeepTheWolfAliveService relaunches iFit every ~11 s over any app it doesn't allow (it allows Prime Video, Hulu, Netflix, Pluto TV, Spotify, Amazon Music, Audible). Privileged mode disables the launcher, but it comes back. Uninstalling it for user 0 stopped the relaunches and survived a restart. (Same advice as geekyschmidt.com's 2026 NordicTrack guide.)
-- **Reinstalling this app clears the home-screen default.** Run `adb shell cmd package set-home-activity com.treadmill.home/.HomeActivity` after every `adb install`.
+- **Once after each restart, iFit shows its "Get started" login screen** (QR code) when a workout ends, and the home screen steps aside for it. Tap **USE IN MANUAL MODE ONLY** once; after that, workouts end on iFit's dashboard, hidden under the tiles, until the next restart.
+- **Reinstalling this app clears the home-screen default** and stops its overlay until the home screen is opened again. Run `adb shell cmd package set-home-activity com.treadmill.home/.HomeActivity` after every `adb install`.
 - The screen is mounted normally (`ro.sf.hwrotation=0`); the 180° rotation lock only applies on consoles that report 180.
 - Shell can't disable a single eru service ("Shell cannot change component state").
 - `app\test\run-tests.ps1 [captured-logcat.txt]` runs the log parser's tests on the PC.
