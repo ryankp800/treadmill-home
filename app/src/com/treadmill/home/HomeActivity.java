@@ -36,7 +36,9 @@ public class HomeActivity extends Activity {
             {"com.netflix.mediaclient"},                       // Netflix
             {"com.google.android.youtube",                     // YouTube (official)
                     "org.schabi.newpipe",                      // NewPipe
-                    "com.teamsmart.videomanager.tv",           // SmartTube
+                    "org.smarttube.stable",                    // SmartTube (stable)
+                    "org.smarttube.beta",                      // SmartTube (beta)
+                    "com.teamsmart.videomanager.tv",           // SmartTube (older builds)
                     "com.futo.platformplayer"},                // Grayjay
             {"com.amazon.avod.thirdpartyclient",               // Prime Video (phone/tablet)
                     "com.amazon.avod"},                        // Prime Video (Fire build)
