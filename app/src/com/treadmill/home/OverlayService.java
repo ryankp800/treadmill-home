@@ -115,7 +115,8 @@ public class OverlayService extends Service {
     private static final long RETURN_AFTER_START_MS = 1500;
     private volatile int startPressBaseline = -1; // presses already in the log buffer at startup
     private int handledStartPresses;
-    private long openedIfitForStartAt;            // 0 = not waiting on iFit's dashboard
+    // 0 = not waiting on iFit's dashboard. Poll thread, but leaveHomeFor (main) cancels it.
+    private volatile long openedIfitForStartAt;
 
     // Non-GlassOS home: our tiles as a full-screen cover over iFit, which must be in front for its
     // Start key to work. When iFit sits on a screen that won't take Start (login, a dialog, a
@@ -577,6 +578,10 @@ public class OverlayService extends Service {
     /** Main thread: open an app from the home screen (or go back to one), taking the cover down. */
     private void leaveHomeFor(Intent intent) {
         homeWanted = false;
+        // Opening an app instead of pressing Start again ends any Start hand-off; otherwise the
+        // next Start press (inside that app) is taken as part of it and nothing happens.
+        if (openedIfitForStartAt != 0) Log.i(TAG, "Start hand-off cancelled: opened an app");
+        openedIfitForStartAt = 0;
         leftHomeAt = android.os.SystemClock.elapsedRealtime();
         // Known now, before the app has had a chance to show up in the foreground events.
         String target = intent.getComponent() != null ? intent.getComponent().getPackageName() : intent.getPackage();
