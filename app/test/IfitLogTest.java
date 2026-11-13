@@ -31,6 +31,7 @@ public class IfitLogTest {
         readyOnAnyScreenDuringAWorkout();
         neverReadyWithADialog();
         unknownScreenCountsAsReady();
+        workoutScreenWithUnknownStateIsAPausedWorkout();
         if (args.length > 0) replay(args[0]);
         if (failures > 0) {
             System.out.println(failures + " FAILED");
@@ -193,6 +194,7 @@ public class IfitLogTest {
         for (String view : new String[] {"InWorkoutView", "EmbeddedOnboardingWebView", "PermissionsActivity",
                 "SplashScreen", "WorkoutResultsView"}) {
             IfitLog log = new IfitLog();
+            log.accept(stateLine("WorkoutResults", "Idle"), 1000); // e.g. left on InWorkoutView after it ended
             log.accept(resumed(view), 1000);
             eq(view + " not ready when idle", false, log.ready(1000));
         }
@@ -216,6 +218,21 @@ public class IfitLogTest {
 
     static void unknownScreenCountsAsReady() {
         eq("nothing seen yet", true, new IfitLog().ready(1000)); // don't hide our home over a guess
+    }
+
+    static void workoutScreenWithUnknownStateIsAPausedWorkout() {
+        // Seen on the 1750 after a reinstall: the log buffer had rolled past the state lines and
+        // iFit sat on its pause screen ("Workout ends in 8:16"). Start resumes from there.
+        for (String view : new String[] {"InWorkoutView", "PreparingWorkoutView"}) {
+            IfitLog log = new IfitLog();
+            log.accept(resumed(view), 1000);
+            eq(view + " with no state", IfitLog.Mode.PAUSED, log.mode(1000));
+            eq(view + " ready", true, log.ready(1000));
+        }
+        IfitLog ended = new IfitLog(); // but a known ended workout on that screen is not
+        ended.accept(resumed("InWorkoutView"), 1000);
+        ended.accept(stateLine("WorkoutResults", "Idle"), 1000);
+        eq("ended workout on InWorkoutView", IfitLog.Mode.IDLE, ended.mode(1000));
     }
 
     /** Replays a real capture end to end and prints what the bar would end up showing. */

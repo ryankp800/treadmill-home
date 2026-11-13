@@ -127,6 +127,9 @@ public class OverlayService extends Service {
     private boolean homeWanted, coverShown;
     private long homeShownAt, notReadySince;
     private long leftHomeAt; // when we last sent the user to an app; iFit's events lag behind
+    private static final int MAX_PUSH_BACKS = 3;
+    private static final long PUSH_BACK_WINDOW_MS = 60_000;
+    private final java.util.ArrayDeque<Long> pushBacks = new java.util.ArrayDeque<>();
     private TextView noticeText;
 
     @Override
@@ -288,17 +291,6 @@ public class OverlayService extends Service {
                     } else {
                         openOurHome(this);
                     }
-                } else if (!glassOs && pkg.equals(IFIT_STANDALONE_PKG) && !homeWanted && !takeoversPaused()
-                        && lastWatchedApp != null
-                        && android.os.SystemClock.elapsedRealtime() - leftHomeAt > FOREGROUND_GRACE_MS) {
-                    // iFit put itself in front over the app being watched (it does when a workout
-                    // ends, or after restarting itself). We didn't ask for it: go back.
-                    Intent back = getPackageManager().getLaunchIntentForPackage(lastWatchedApp);
-                    if (back != null) {
-                        Log.i(TAG, "iFit came forward on its own (" + cls + "); back to " + lastWatchedApp);
-                        startActivity(back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                        leftHomeAt = android.os.SystemClock.elapsedRealtime(); // let it come forward
-                    }
                 } else if (!pkg.startsWith("com.ifit.") && !pkg.equals(getPackageName())
                         && !pkg.equals("android")) {
                     lastWatchedApp = pkg;
@@ -306,11 +298,41 @@ public class OverlayService extends Service {
                     lastWatchedApp = null;
                 }
             }
+            if (!glassOs) keepIfitBehindWatchedApp();
         } catch (Exception ex) {
             Log.w(TAG, "foreground watch failed: " + ex);
         }
         checkIdleDim();
         main.postDelayed(this::watchForeground, FOREGROUND_WATCH_MS);
+    }
+
+    /**
+     * Main thread, every second. iFit puts itself in front over the app being watched: when a
+     * workout starts (it switches to its workout screen a few seconds after Start) or ends, and
+     * when it restarts. We didn't ask for it, so go back to that app. Checked against what is in
+     * front now, not only fresh events: if iFit came forward during the grace period after opening
+     * the app, its event is long gone by the time the grace period ends. If iFit keeps winning
+     * (something relaunching it), stop fighting and show the home screen over it instead.
+     */
+    private void keepIfitBehindWatchedApp() {
+        if (homeWanted || takeoversPaused() || lastWatchedApp == null) return;
+        if (!IFIT_STANDALONE_PKG.equals(foregroundPkg)) return;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - leftHomeAt <= FOREGROUND_GRACE_MS) return; // the app may still be starting
+        while (!pushBacks.isEmpty() && now - pushBacks.peekFirst() > PUSH_BACK_WINDOW_MS) pushBacks.pollFirst();
+        if (pushBacks.size() >= MAX_PUSH_BACKS) {
+            Log.w(TAG, "iFit keeps coming forward over " + lastWatchedApp + "; showing home over it instead");
+            pushBacks.clear();
+            lastWatchedApp = null;
+            showHome();
+            return;
+        }
+        Intent back = getPackageManager().getLaunchIntentForPackage(lastWatchedApp);
+        if (back == null) return;
+        Log.i(TAG, "iFit came forward on its own; back to " + lastWatchedApp);
+        pushBacks.addLast(now);
+        leftHomeAt = now; // give the app time to come forward again
+        startActivity(back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
     }
 
     @Override
@@ -556,6 +578,9 @@ public class OverlayService extends Service {
     private void leaveHomeFor(Intent intent) {
         homeWanted = false;
         leftHomeAt = android.os.SystemClock.elapsedRealtime();
+        // Known now, before the app has had a chance to show up in the foreground events.
+        String target = intent.getComponent() != null ? intent.getComponent().getPackageName() : intent.getPackage();
+        if (target != null && !target.startsWith("com.ifit.")) lastWatchedApp = target;
         try {
             startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
         } catch (Exception e) {
@@ -650,12 +675,21 @@ public class OverlayService extends Service {
         } else if (now - notReadySince > NOT_READY_GRACE_MS && coverShown) {
             Log.i(TAG, "iFit needs a tap; stepping aside");
             removeCover("iFit needs a tap");
-            noticeText.setVisibility(View.VISIBLE);
+            setNotice(true);
         }
     }
 
     private void hideNotice() {
-        if (noticeText != null) noticeText.setVisibility(View.GONE);
+        setNotice(false);
+    }
+
+    /** The bar's window keeps its first width unless told to re-measure, which would clip the note. */
+    private void setNotice(boolean shown) {
+        if (noticeText == null) return;
+        int visibility = shown ? View.VISIBLE : View.GONE;
+        if (noticeText.getVisibility() == visibility) return;
+        noticeText.setVisibility(visibility);
+        if (bar != null && bar.isAttachedToWindow()) windowManager.updateViewLayout(bar, params);
     }
 
     private void show(double kph, double incline, int seconds, double km) {

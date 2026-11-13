@@ -35,7 +35,34 @@ This is a running machine. Read this before anything else.
 
 ## Tested on
 
-NordicTrack Commercial 2250, GlassOS 2026.06.26 ("Gen 6", CLASSIC), Android 9 (system version EKA2_20221110), MediaTek tablet with 2 GB RAM, 1920x1080. Other GlassOS consoles will probably work, but nothing else has been tested. Older iFit/ERU consoles (pre-GlassOS) won't work.
+NordicTrack Commercial 2250, GlassOS 2026.06.26 ("Gen 6", CLASSIC), Android 9 (system version EKA2_20221110), MediaTek tablet with 2 GB RAM, 1920x1080. Other GlassOS consoles will probably work, but nothing else has been tested.
+
+Also: NordicTrack Commercial 1750 on the older iFit "standalone" app (no GlassOS), see the next section.
+
+## Consoles without GlassOS (NordicTrack Commercial 1750)
+
+Tested on a Commercial 1750: Android 9 (MKA2_20230329), iFit standalone 2.6.88–2.6.90, eru 2.13.9. Here the iFit app itself drives the motor board over USB, so it has to keep running. The app detects this (no `com.ifit.glassos_service`) and works differently:
+
+- **Stats** come from iFit's own log lines (speed, incline, workout state), not GlassOS. Grant once: `adb shell pm grant com.treadmill.home android.permission.READ_LOGS`.
+- **No on-screen speed/incline/start buttons.** Use the console's physical keys and the safety key.
+- **The home screen covers iFit.** iFit only takes the console's Start key while one of its screens is in front, so the tiles are drawn as an overlay on top of iFit's dashboard. One Start press starts the belt and iFit is never seen. If iFit sits on a screen that won't take Start (login, "Workout not saved", results), the cover steps aside with "iFit needs a tap" in the bar and comes back afterwards.
+- **iFit jumping in** over a streaming app (it does when a workout starts or ends) is sent back to the app within about a second.
+
+Setup differences from the steps below: skip the certificates (step 3) and the eru removal (step 5). Then:
+
+```powershell
+adb shell pm grant com.treadmill.home android.permission.READ_LOGS
+adb shell pm uninstall --user 0 com.ifit.launcher   # undo: adb shell pm install-existing --user 0 com.ifit.launcher
+```
+
+Lessons from the 1750:
+
+- **Keep eru.** It grants iFit its USB permission for the motor board when it launches iFit at boot. With eru disabled, iFit sat on its splash screen ("Requesting USB Permissions") after a restart and the belt could not run.
+- **Uninstall iFit's launcher, don't just disable it.** While `com.ifit.launcher` is enabled, eru's KeepTheWolfAliveService relaunches iFit every ~11 s over any app it doesn't allow (it allows Prime Video, Hulu, Netflix, Pluto TV, Spotify, Amazon Music, Audible). Privileged mode disables the launcher, but it comes back. Uninstalling it for user 0 stopped the relaunches and survived a restart. (Same advice as geekyschmidt.com's 2026 NordicTrack guide.)
+- **Reinstalling this app clears the home-screen default.** Run `adb shell cmd package set-home-activity com.treadmill.home/.HomeActivity` after every `adb install`.
+- The screen is mounted normally (`ro.sf.hwrotation=0`); the 180° rotation lock only applies on consoles that report 180.
+- Shell can't disable a single eru service ("Shell cannot change component state").
+- `app\test\run-tests.ps1 [captured-logcat.txt]` runs the log parser's tests on the PC.
 
 ## Known limits
 

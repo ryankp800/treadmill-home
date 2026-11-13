@@ -137,8 +137,11 @@ public final class IfitLog {
         switch (state) {
             case "Paused":
                 return Mode.PAUSED;
-            case "":
-                return kph > 0 ? Mode.RUNNING : Mode.IDLE; // started mid-workout: go by the belt
+            case "": // started mid-workout, or the state line rotated out of the log buffer
+                if (kph > 0) return Mode.RUNNING;
+                // iFit only shows these during a workout; stopped there means paused.
+                return screen.equals("InWorkoutView") || screen.equals("PreparingWorkoutView")
+                        ? Mode.PAUSED : Mode.IDLE;
             case "Idle":
             case "Results":
             case "WorkoutResults":
