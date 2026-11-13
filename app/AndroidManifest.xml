@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+    <!-- Non-GlassOS consoles: belt state comes from iFit's log. Granted once over adb. -->
+    <uses-permission android:name="android.permission.READ_LOGS" />
 
     <!-- testOnly: lets `dpm remove-active-admin` undo the device-owner role from the PC. -->
     <application

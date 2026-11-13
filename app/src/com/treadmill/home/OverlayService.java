@@ -26,7 +26,9 @@ import java.util.Locale;
 /**
  * Floating, read-only panels on top of every app: a bar with speed, incline, time and distance,
  * and a 400 m track with laps, pace and moving time.
- * Values come from GlassOS on the console itself; this never changes speed or incline.
+ * Values come from GlassOS on the console itself. Consoles without GlassOS (older iFit
+ * "standalone", e.g. the Commercial 1750) get them from iFit's own log lines instead (IfitLog);
+ * there the on-screen motor controls are hidden and the console's own buttons are the only controls.
  */
 public class OverlayService extends Service {
 
@@ -96,16 +98,38 @@ public class OverlayService extends Service {
     private long lastClockLogAt;
     private static final long CLOCK_LOG_MS = 30_000;
 
+    // Non-GlassOS consoles: belt state from iFit's log (see IfitLog). Guarded by itself.
+    static final String GLASSOS_PKG = "com.ifit.glassos_service";
+    private boolean glassOs;
+    private final IfitLog ifitLog = new IfitLog();
+    private Thread logReader;
+    private volatile Process logcat;
+    private volatile boolean stopping;
+    private double logKm;      // distance from speed x time; iFit's log has no distance
+    private long lastLogPollAt;
+    // iFit only takes a Start press for a new workout while its dashboard is on screen. When it
+    // ignores one, we bring the dashboard up so the next press starts the belt, then step back.
+    static final String IFIT_STANDALONE_PKG = "com.ifit.standalone";
+    private static final long START_HANDOFF_TIMEOUT_MS = 60_000;
+    private static final long RETURN_AFTER_START_MS = 1500;
+    private volatile int startPressBaseline = -1; // presses already in the log buffer at startup
+    private int handledStartPresses;
+    private long openedIfitForStartAt;            // 0 = not waiting on iFit's dashboard
+
     @Override
     public void onCreate() {
         super.onCreate();
+        glassOs = isInstalled(GLASSOS_PKG);
+        Log.i(TAG, glassOs ? "GlassOS console" : "no GlassOS: reading belt state from iFit's log");
         startInForeground();
         addBar();
         addTrack();
+        if (!glassOs) controlsToggle.setVisibility(View.GONE); // nothing to send commands to
 
         pollThread = new HandlerThread("glassos-poll");
         pollThread.start();
         poller = new Handler(pollThread.getLooper());
+        if (!glassOs) startLogReader();
         poller.post(this::poll);
         main.post(this::watchForeground);
         addTouchWatcher();
@@ -114,7 +138,16 @@ public class OverlayService extends Service {
         status = new StatusServer(this, this::statusLines);
         status.start();
         main.post(this::applyDeviceSetup);
-        main.postDelayed(this::checkMotorSafetyNet, 30_000);
+        if (glassOs) main.postDelayed(this::checkMotorSafetyNet, 30_000); // watches the GlassOS motor service
+    }
+
+    private boolean isInstalled(String pkg) {
+        try {
+            getPackageManager().getApplicationInfo(pkg, 0);
+            return true;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return false;
+        }
     }
 
     /** Re-applies DeviceSetup and the rotation lock at start (i.e. at boot) and every few minutes after. */
@@ -140,8 +173,16 @@ public class OverlayService extends Service {
     private String statusLines() {
         long sincePoll = lastGoodPollAt == 0 ? -1
                 : (android.os.SystemClock.elapsedRealtime() - lastGoodPollAt) / 1000;
-        return "glassos    " + (sincePoll < 0 ? "never answered" : sincePoll <= 5 ? "answering"
-                : "no answer for " + sincePoll + " s") + '\n'
+        String source;
+        if (glassOs) {
+            source = "glassos    " + (sincePoll < 0 ? "never answered" : sincePoll <= 5 ? "answering"
+                    : "no answer for " + sincePoll + " s");
+        } else {
+            source = "ifit log   " + (!canReadLogs() ? "NO PERMISSION (adb shell pm grant "
+                    + getPackageName() + " android.permission.READ_LOGS)" : sincePoll < 0 ? "no reading yet"
+                    : sincePoll <= 5 ? "reading" : "no fresh reading for " + sincePoll + " s");
+        }
+        return source + '\n'
                 + "lock       " + (locked ? "LOCKED (orange bar showing)" : "unlocked") + '\n'
                 + "screen     " + (dimmed ? "dimmed" : "normal") + '\n'
                 + "takeovers  " + (takeoversPaused ? "paused (maintenance)" : "active") + '\n'
@@ -258,6 +299,9 @@ public class OverlayService extends Service {
 
     @Override
     public void onDestroy() {
+        stopping = true;
+        Process p = logcat;
+        if (p != null) p.destroy();
         main.removeCallbacksAndMessages(null);
         poller.removeCallbacksAndMessages(null);
         pollThread.quitSafely();
@@ -275,6 +319,11 @@ public class OverlayService extends Service {
     }
 
     private void poll() {
+        if (!glassOs) {
+            pollIfitLog();
+            poller.postDelayed(this::poll, POLL_MS);
+            return;
+        }
         long delay = POLL_MS;
         try {
             if (client == null) client = new GlassOsClient(this, "localhost", 54321);
@@ -297,6 +346,152 @@ public class OverlayService extends Service {
             delay = RETRY_MS;
         }
         poller.postDelayed(this::poll, delay);
+    }
+
+    // ---- Non-GlassOS consoles: iFit's log ----
+
+    private boolean canReadLogs() {
+        return checkSelfPermission(android.Manifest.permission.READ_LOGS)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * Follows iFit's log lines (tag mono-stdout) on a thread of its own, restarting logcat if it
+     * ever exits. First reads what is already in the log buffer (so a workout that began before
+     * this service did is picked up), then follows new lines. Start presses from that backlog are
+     * history, not requests, so they're recorded as the baseline. Without READ_LOGS logcat only
+     * returns our own lines, so the bar would sit at zero; it shows "--" instead (pollIfitLog).
+     */
+    private void startLogReader() {
+        logReader = new Thread(() -> {
+            if (canReadLogs()) {
+                readLogcat("-d"); // dump the backlog and exit
+                synchronized (ifitLog) {
+                    startPressBaseline = ifitLog.startPresses();
+                }
+            }
+            while (!stopping) {
+                if (startPressBaseline < 0) startPressBaseline = 0; // permission granted later
+                readLogcat("-T", "1"); // new lines only, until logcat exits
+                if (!stopping) {
+                    Log.w(TAG, "logcat exited; restarting");
+                    android.os.SystemClock.sleep(RETRY_MS);
+                }
+            }
+        }, "ifit-log");
+        logReader.setDaemon(true);
+        logReader.start();
+    }
+
+    private void readLogcat(String... mode) {
+        try {
+            java.util.List<String> cmd = new java.util.ArrayList<>(java.util.Arrays.asList("logcat", "-v", "brief"));
+            cmd.addAll(java.util.Arrays.asList(mode));
+            cmd.addAll(java.util.Arrays.asList("mono-stdout:V", "*:S"));
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            logcat = p;
+            try (java.io.BufferedReader in = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = in.readLine()) != null) {
+                    synchronized (ifitLog) {
+                        ifitLog.accept(line, android.os.SystemClock.elapsedRealtime());
+                    }
+                }
+            }
+            p.waitFor();
+        } catch (Exception e) {
+            if (!stopping) Log.w(TAG, "iFit log reader failed: " + e);
+        }
+    }
+
+    /** Once a second on the poll thread: turns iFit's last logged values into a bar update. */
+    private void pollIfitLog() {
+        if (!canReadLogs()) {
+            main.post(this::showDisconnected);
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        double kph, grade;
+        IfitLog.Mode mode;
+        boolean stale;
+        int startPresses;
+        synchronized (ifitLog) {
+            kph = ifitLog.kph();
+            grade = ifitLog.grade();
+            mode = ifitLog.mode(now);
+            stale = ifitLog.stale(now);
+            startPresses = ifitLog.startPresses();
+        }
+        handleStartKey(mode, startPresses, now);
+        if (stale) { // running but iFit went quiet: don't show a speed we can't vouch for
+            main.post(this::showDisconnected);
+            lastLogPollAt = now;
+            return;
+        }
+        workoutState = mode == IfitLog.Mode.RUNNING ? WORKOUT_RUNNING
+                : mode == IfitLog.Mode.PAUSED ? WORKOUT_PAUSED : 1;
+        if (mode == IfitLog.Mode.IDLE) {
+            logKm = 0;
+        } else if (lastLogPollAt != 0) {
+            logKm += kph * (now - lastLogPollAt) / 3_600_000.0;
+        }
+        lastLogPollAt = now;
+        lastGoodPollAt = now;
+        final double km = logKm;
+        final int seconds = mode == IfitLog.Mode.IDLE ? 0 : 1; // only "is there a workout" matters to show()
+        main.post(() -> show(kph, grade, seconds, km));
+    }
+
+    /**
+     * Poll thread. A Start press with no workout while iFit isn't on screen just beeps (iFit only
+     * enables the key on its dashboard), so open the dashboard: the user's next press starts the
+     * belt. Once the workout has started, or after a minute without one, go back to what they were
+     * watching. Never starts the belt itself: that always takes the physical Start key.
+     */
+    private void handleStartKey(IfitLog.Mode mode, int startPresses, long now) {
+        int baseline = startPressBaseline;
+        if (baseline < 0) return; // still reading the backlog
+        if (handledStartPresses < baseline) handledStartPresses = baseline;
+        boolean newPress = startPresses > handledStartPresses;
+        handledStartPresses = startPresses;
+
+        if (openedIfitForStartAt != 0) {
+            if (mode != IfitLog.Mode.IDLE) {
+                openedIfitForStartAt = 0;
+                Log.i(TAG, "workout started from iFit's dashboard; stepping back");
+                main.postDelayed(this::returnFromIfit, RETURN_AFTER_START_MS);
+            } else if (now - openedIfitForStartAt > START_HANDOFF_TIMEOUT_MS) {
+                openedIfitForStartAt = 0;
+                main.post(this::returnFromIfit);
+            }
+            return;
+        }
+        if (newPress && mode == IfitLog.Mode.IDLE && !takeoversPaused()) {
+            String fg = foregroundPkg;
+            if (fg != null && fg.equals(IFIT_STANDALONE_PKG)) return; // iFit is up: it takes the press
+            Intent ifit = getPackageManager().getLaunchIntentForPackage(IFIT_STANDALONE_PKG);
+            if (ifit == null) return;
+            openedIfitForStartAt = now;
+            Log.i(TAG, "Start pressed with no workout; opening iFit's dashboard for the next press");
+            main.post(() -> {
+                startActivity(ifit.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                android.widget.Toast.makeText(this, "Press Start again to begin",
+                        android.widget.Toast.LENGTH_LONG).show();
+            });
+        }
+    }
+
+    /** Main thread: back to what was on screen before iFit's dashboard, if iFit is still in front. */
+    private void returnFromIfit() {
+        String fg = foregroundPkg;
+        if (takeoversPaused() || fg == null || !fg.startsWith("com.ifit.")) return;
+        Intent back = lastWatchedApp == null ? null : getPackageManager().getLaunchIntentForPackage(lastWatchedApp);
+        if (back != null) {
+            startActivity(back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } else {
+            openOurHome(this);
+        }
     }
 
     private void show(double kph, double incline, int seconds, double km) {
@@ -448,6 +643,7 @@ public class OverlayService extends Service {
      */
     private void lockRotation() {
         if (!android.provider.Settings.System.canWrite(this)) return;
+        if (!"180".equals(systemProperty("ro.sf.hwrotation"))) return; // e.g. the 1750 (0): leave it alone
         android.content.ContentResolver cr = getContentResolver();
         int auto = android.provider.Settings.System.getInt(cr,
                 android.provider.Settings.System.ACCELEROMETER_ROTATION, 1);
@@ -458,6 +654,15 @@ public class OverlayService extends Service {
             android.provider.Settings.System.putInt(cr, android.provider.Settings.System.USER_ROTATION,
                     android.view.Surface.ROTATION_180);
             Log.i(TAG, "rotation fixed (was auto=" + auto + " rotation=" + rotation + ")");
+        }
+    }
+
+    private static String systemProperty(String key) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            return (String) sp.getMethod("get", String.class).invoke(null, key);
+        } catch (Exception e) {
+            return "";
         }
     }
 

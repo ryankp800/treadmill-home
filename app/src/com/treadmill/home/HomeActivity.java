@@ -175,7 +175,9 @@ public class HomeActivity extends Activity {
                 startActivity(new Intent().setClassName("com.ifit.mithlond",
                         "com.ifit.mithlond.view.SplashScreenActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             } catch (Exception ignored) {
-                // Neither iFit screen is available; nothing more to do from here.
+                // Older iFit "standalone" consoles (e.g. the 1750): open the iFit app itself.
+                Intent ifit = getPackageManager().getLaunchIntentForPackage("com.ifit.standalone");
+                if (ifit != null) startActivity(ifit.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             }
         }
     }
