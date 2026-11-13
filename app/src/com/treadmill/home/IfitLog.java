@@ -23,6 +23,10 @@ public final class IfitLog {
     /** While running, iFit logs CurrentTime every second; this much silence means we lost it. */
     public static final long STALE_MS = 10_000;
 
+    // iFit's screens and dialogs, to know whether it would take a Start press right now.
+    private static final Pattern RESUMED = Pattern.compile("\\[Trace:MainApplication\\] (\\w+) is being resumed");
+    private static final Pattern DIALOG = Pattern.compile("\\[Trace:Navigation\\] Setting dialog visibility to: (True|False)");
+
     // Only FitPro lines: FitnessConsole repeats the same changes ("Kph changed from a to b").
     private static final Pattern FITPRO = Pattern.compile("\\[Trace:FitPro\\] (.*)$");
     private static final Pattern KPH = Pattern.compile("^Changed KPH to: (-?[0-9.]+)\\s*$");
@@ -36,12 +40,24 @@ public final class IfitLog {
     private double grade;
     private String state = "";
     private long lastFitProAt = -1;
+    private String screen = "";
+    private boolean dialogShown;
     private int startPresses;
     private long lastStartAt = Long.MIN_VALUE / 2;
 
     /** Feeds one logcat line, seen at {@code nowMs} (any monotonic clock). */
     public void accept(String line, long nowMs) {
         if (line == null) return;
+        Matcher view = RESUMED.matcher(line);
+        if (view.find()) {
+            noteScreen(view.group(1));
+            return;
+        }
+        Matcher dialog = DIALOG.matcher(line);
+        if (dialog.find()) {
+            dialogShown = dialog.group(1).equals("True");
+            return;
+        }
         Matcher fitPro = FITPRO.matcher(line);
         if (!fitPro.find()) return;
         lastFitProAt = nowMs;
@@ -61,6 +77,38 @@ public final class IfitLog {
         } catch (NumberFormatException ignored) {
             // A malformed number: keep the last good value.
         }
+    }
+
+    /**
+     * iFit's screen now in front, from its log or from Android's foreground events. Takes a class
+     * name with or without its package ("crc64….DashboardView"). A new screen closes any dialog.
+     */
+    public void noteScreen(String className) {
+        if (className == null || className.isEmpty()) return;
+        String simple = className.substring(className.lastIndexOf('.') + 1);
+        if (!simple.equals(screen)) dialogShown = false;
+        screen = simple;
+    }
+
+    /** iFit's last screen, e.g. "DashboardView"; empty until one is seen. */
+    public String screen() {
+        return screen;
+    }
+
+    public boolean dialogShown() {
+        return dialogShown;
+    }
+
+    /**
+     * Whether iFit would act on the console's Start key now: during a workout (Start resumes a
+     * paused one from any screen), or with no workout while its dashboard is up. Never with a
+     * dialog open (e.g. "Workout not saved"). Unknown counts as ready, so nothing gets hidden
+     * or shown on a guess.
+     */
+    public boolean ready(long nowMs) {
+        if (dialogShown) return false;
+        if (mode(nowMs) != Mode.IDLE || screen.isEmpty()) return true;
+        return screen.contains("Dashboard");
     }
 
     public double kph() {
@@ -93,6 +141,7 @@ public final class IfitLog {
                 return kph > 0 ? Mode.RUNNING : Mode.IDLE; // started mid-workout: go by the belt
             case "Idle":
             case "Results":
+            case "WorkoutResults":
             case "Finished":
             case "Summary":
             case "Done":

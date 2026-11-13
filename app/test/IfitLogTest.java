@@ -23,6 +23,14 @@ public class IfitLogTest {
         stoppedIsNeverStale();
         countsStartKeyPresses();
         workoutStateIsRunning();
+        workoutResultsIsNoWorkout();
+        tracksScreenFromLog();
+        tracksScreenFromForegroundClass();
+        tracksDialogs();
+        readyOnlyOnDashboardWhenIdle();
+        readyOnAnyScreenDuringAWorkout();
+        neverReadyWithADialog();
+        unknownScreenCountsAsReady();
         if (args.length > 0) replay(args[0]);
         if (failures > 0) {
             System.out.println(failures + " FAILED");
@@ -130,6 +138,84 @@ public class IfitLogTest {
         IfitLog log = new IfitLog(); // seen on the 1750: Idle -> WarmUp -> Workout -> Paused
         log.accept(stateLine("WarmUp", "Workout"), 1000);
         eq("Workout mode", IfitLog.Mode.RUNNING, log.mode(1000));
+    }
+
+    static void workoutResultsIsNoWorkout() {
+        IfitLog log = new IfitLog(); // seen on the 1750 after a second Stop: Paused -> WorkoutResults -> Idle
+        log.accept(stateLine("Paused", "WorkoutResults"), 1000);
+        eq("WorkoutResults mode", IfitLog.Mode.IDLE, log.mode(1000));
+    }
+
+    static String resumed(String view) {
+        return "11-13 20:56:29.258 V/mono-stdout( 3228): [1] [Trace:MainApplication] " + view + " is being resumed";
+    }
+
+    static final String DIALOG_ON = "11-13 19:53:18.522 V/mono-stdout(29446): [1] [Trace:Navigation] Setting dialog "
+            + "visibility to: True for: Wolf.Android.Views.Dialogs.SimpleConfirmation.SimpleConfirmationDialog";
+    static final String DIALOG_OFF = DIALOG_ON.replace("to: True", "to: False");
+
+    static void tracksScreenFromLog() {
+        IfitLog log = new IfitLog();
+        eq("no screen yet", "", log.screen());
+        log.accept(resumed("EmbeddedNoWifiDashboardView"), 1000);
+        eq("screen", "EmbeddedNoWifiDashboardView", log.screen());
+        log.accept("11-13 20:56:28.834 V/mono-stdout( 3228): [1] [Trace:MainApplication] "
+                + "EmbeddedNoWifiDashboardView is being paused", 1000);
+        eq("pause doesn't change it", "EmbeddedNoWifiDashboardView", log.screen());
+    }
+
+    static void tracksScreenFromForegroundClass() {
+        IfitLog log = new IfitLog();
+        log.noteScreen("crc6421f033f4f5053777.EmbeddedOnboardingWebView");
+        eq("simple name", "EmbeddedOnboardingWebView", log.screen());
+        log.noteScreen("DashboardView");
+        eq("already simple", "DashboardView", log.screen());
+    }
+
+    static void tracksDialogs() {
+        IfitLog log = new IfitLog();
+        log.accept(resumed("InWorkoutView"), 1000);
+        log.accept(DIALOG_ON, 1000);
+        eq("dialog up", true, log.dialogShown());
+        log.accept(DIALOG_OFF, 2000);
+        eq("dialog closed", false, log.dialogShown());
+        log.accept(DIALOG_ON, 3000);
+        log.accept(resumed("DashboardView"), 4000);
+        eq("new screen clears it", false, log.dialogShown());
+    }
+
+    static void readyOnlyOnDashboardWhenIdle() {
+        for (String view : new String[] {"DashboardView", "EmbeddedNoWifiDashboardView"}) {
+            IfitLog log = new IfitLog();
+            log.accept(resumed(view), 1000);
+            eq(view + " ready", true, log.ready(1000));
+        }
+        for (String view : new String[] {"InWorkoutView", "EmbeddedOnboardingWebView", "PermissionsActivity",
+                "SplashScreen", "WorkoutResultsView"}) {
+            IfitLog log = new IfitLog();
+            log.accept(resumed(view), 1000);
+            eq(view + " not ready when idle", false, log.ready(1000));
+        }
+    }
+
+    static void readyOnAnyScreenDuringAWorkout() {
+        IfitLog log = new IfitLog(); // Start resumes a paused workout from anywhere
+        log.accept(resumed("InWorkoutView"), 1000);
+        log.accept(PAUSED, 1000);
+        eq("paused on InWorkoutView", true, log.ready(1000));
+        log.accept(stateLine("Paused", "Workout"), 2000);
+        eq("running", true, log.ready(2000));
+    }
+
+    static void neverReadyWithADialog() {
+        IfitLog log = new IfitLog();
+        log.accept(resumed("DashboardView"), 1000);
+        log.accept(DIALOG_ON, 1000);
+        eq("dashboard with dialog", false, log.ready(1000));
+    }
+
+    static void unknownScreenCountsAsReady() {
+        eq("nothing seen yet", true, new IfitLog().ready(1000)); // don't hide our home over a guess
     }
 
     /** Replays a real capture end to end and prints what the bar would end up showing. */

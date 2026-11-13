@@ -34,6 +34,7 @@ public class OverlayService extends Service {
 
     private static final String TAG = "TreadmillOverlay";
     static final String EXTRA_FROM_BOOT = "fromBoot";
+    static final String EXTRA_SHOW_HOME = "showHome";
     private static final long[] BOOT_HOME_DELAYS_MS = {45_000, 90_000};
     private static final long FOREGROUND_WATCH_MS = 1000;
     private static final String IFIT_NO_CONNECTION = "NoConnectionActivity";
@@ -115,6 +116,18 @@ public class OverlayService extends Service {
     private volatile int startPressBaseline = -1; // presses already in the log buffer at startup
     private int handledStartPresses;
     private long openedIfitForStartAt;            // 0 = not waiting on iFit's dashboard
+
+    // Non-GlassOS home: our tiles as a full-screen cover over iFit, which must be in front for its
+    // Start key to work. When iFit sits on a screen that won't take Start (login, a dialog, a
+    // results page), the cover steps aside so it can be tapped, then comes back. Main thread only.
+    private static final long NOT_READY_GRACE_MS = 3000; // iFit passes through splash screens
+    private static final long FOREGROUND_GRACE_MS = 4000; // iFit coming forward after showHome
+    private HomeView homeCover;
+    private WindowManager.LayoutParams coverParams;
+    private boolean homeWanted, coverShown;
+    private long homeShownAt, notReadySince;
+    private long leftHomeAt; // when we last sent the user to an app; iFit's events lag behind
+    private TextView noticeText;
 
     @Override
     public void onCreate() {
@@ -259,6 +272,13 @@ public class OverlayService extends Service {
             }
             if (pkg != null) {
                 foregroundPkg = pkg;
+                if (!glassOs && pkg.equals(IFIT_STANDALONE_PKG) && cls != null) {
+                    synchronized (ifitLog) {
+                        // Only when iFit's log hasn't named a screen (its line rotated away):
+                        // these events can lag the log by a second and would undo a newer screen.
+                        if (ifitLog.screen().isEmpty()) ifitLog.noteScreen(cls);
+                    }
+                }
                 if (cls != null && cls.endsWith(IFIT_NO_CONNECTION) && !takeoversPaused()) {
                     Log.i(TAG, "pushing away iFit No Connection screen, back to " + lastWatchedApp);
                     Intent back = lastWatchedApp == null ? null
@@ -267,6 +287,17 @@ public class OverlayService extends Service {
                         startActivity(back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                     } else {
                         openOurHome(this);
+                    }
+                } else if (!glassOs && pkg.equals(IFIT_STANDALONE_PKG) && !homeWanted && !takeoversPaused()
+                        && lastWatchedApp != null
+                        && android.os.SystemClock.elapsedRealtime() - leftHomeAt > FOREGROUND_GRACE_MS) {
+                    // iFit put itself in front over the app being watched (it does when a workout
+                    // ends, or after restarting itself). We didn't ask for it: go back.
+                    Intent back = getPackageManager().getLaunchIntentForPackage(lastWatchedApp);
+                    if (back != null) {
+                        Log.i(TAG, "iFit came forward on its own (" + cls + "); back to " + lastWatchedApp);
+                        startActivity(back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                        leftHomeAt = android.os.SystemClock.elapsedRealtime(); // let it come forward
                     }
                 } else if (!pkg.startsWith("com.ifit.") && !pkg.equals(getPackageName())
                         && !pkg.equals("android")) {
@@ -284,6 +315,9 @@ public class OverlayService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && intent.getBooleanExtra(EXTRA_SHOW_HOME, false) && !glassOs) {
+            main.post(this::showHome);
+        }
         if (intent != null && intent.getBooleanExtra(EXTRA_FROM_BOOT, false)) {
             // After a restart iFit may load its own home on top; take the screen back once it's done,
             // but only from iFit: never pull the user out of Netflix/Crunchyroll.
@@ -306,6 +340,7 @@ public class OverlayService extends Service {
         poller.removeCallbacksAndMessages(null);
         pollThread.quitSafely();
         if (client != null) client.close();
+        if (coverShown) windowManager.removeView(homeCover);
         if (bar != null) windowManager.removeView(bar);
         if (track != null) windowManager.removeView(track);
         if (touchWatcher != null) windowManager.removeView(touchWatcher);
@@ -416,14 +451,17 @@ public class OverlayService extends Service {
         IfitLog.Mode mode;
         boolean stale;
         int startPresses;
+        boolean ready;
         synchronized (ifitLog) {
             kph = ifitLog.kph();
             grade = ifitLog.grade();
             mode = ifitLog.mode(now);
             stale = ifitLog.stale(now);
             startPresses = ifitLog.startPresses();
+            ready = ifitLog.ready(now);
         }
         handleStartKey(mode, startPresses, now);
+        main.post(() -> updateCover(ready));
         if (stale) { // running but iFit went quiet: don't show a speed we can't vouch for
             main.post(this::showDisconnected);
             lastLogPollAt = now;
@@ -444,10 +482,11 @@ public class OverlayService extends Service {
     }
 
     /**
-     * Poll thread. A Start press with no workout while iFit isn't on screen just beeps (iFit only
-     * enables the key on its dashboard), so open the dashboard: the user's next press starts the
-     * belt. Once the workout has started, or after a minute without one, go back to what they were
-     * watching. Never starts the belt itself: that always takes the physical Start key.
+     * Poll thread. A Start press with no workout while iFit isn't in front just beeps (iFit only
+     * enables the key on its dashboard), so bring the home screen up, which puts iFit's dashboard
+     * in front underneath it: the user's next press starts the belt. Once the workout has started,
+     * or after a minute without one, go back to what they were watching. Never starts the belt
+     * itself: that always takes the physical Start key.
      */
     private void handleStartKey(IfitLog.Mode mode, int startPresses, long now) {
         int baseline = startPressBaseline;
@@ -470,28 +509,153 @@ public class OverlayService extends Service {
         if (newPress && mode == IfitLog.Mode.IDLE && !takeoversPaused()) {
             String fg = foregroundPkg;
             if (fg != null && fg.equals(IFIT_STANDALONE_PKG)) return; // iFit is up: it takes the press
-            Intent ifit = getPackageManager().getLaunchIntentForPackage(IFIT_STANDALONE_PKG);
-            if (ifit == null) return;
             openedIfitForStartAt = now;
-            Log.i(TAG, "Start pressed with no workout; opening iFit's dashboard for the next press");
+            Log.i(TAG, "Start pressed with no workout; bringing iFit's dashboard up for the next press");
             main.post(() -> {
-                startActivity(ifit.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                showHome();
                 android.widget.Toast.makeText(this, "Press Start again to begin",
                         android.widget.Toast.LENGTH_LONG).show();
             });
         }
     }
 
-    /** Main thread: back to what was on screen before iFit's dashboard, if iFit is still in front. */
+    /**
+     * Main thread: after a Start hand-off, back to the app they were watching. If they were on the
+     * home screen, they're already back there.
+     */
     private void returnFromIfit() {
         String fg = foregroundPkg;
         if (takeoversPaused() || fg == null || !fg.startsWith("com.ifit.")) return;
         Intent back = lastWatchedApp == null ? null : getPackageManager().getLaunchIntentForPackage(lastWatchedApp);
-        if (back != null) {
-            startActivity(back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-        } else {
-            openOurHome(this);
+        if (back != null) leaveHomeFor(back);
+    }
+
+    // ---- Non-GlassOS home: the cover over iFit ----
+
+    static boolean isGlassOsConsole(android.content.Context context) {
+        try {
+            context.getPackageManager().getApplicationInfo(GLASSOS_PKG, 0);
+            return true;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return false;
         }
+    }
+
+    /** Main thread: our tiles on top, iFit's current screen (normally its dashboard) underneath. */
+    private void showHome() {
+        if (glassOs || takeoversPaused()) return;
+        homeWanted = true;
+        homeShownAt = android.os.SystemClock.elapsedRealtime();
+        notReadySince = 0;
+        Intent ifit = getPackageManager().getLaunchIntentForPackage(IFIT_STANDALONE_PKG);
+        if (ifit != null) startActivity(ifit.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        addCover();
+    }
+
+    /** Main thread: open an app from the home screen (or go back to one), taking the cover down. */
+    private void leaveHomeFor(Intent intent) {
+        homeWanted = false;
+        leftHomeAt = android.os.SystemClock.elapsedRealtime();
+        try {
+            startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } catch (Exception e) {
+            Log.w(TAG, "could not open " + intent + ": " + e);
+        }
+        hideNotice();
+        // Wait for the app to come up first, so iFit's dashboard doesn't flash in between.
+        main.postDelayed(() -> {
+            if (!homeWanted) removeCover("opened an app");
+        }, 500);
+    }
+
+    private void addCover() {
+        if (coverShown) return;
+        if (homeCover == null) {
+            homeCover = new HomeView(this, new HomeView.Listener() {
+                @Override
+                public void onLaunch(Intent intent) {
+                    leaveHomeFor(intent);
+                }
+
+                @Override
+                public void onMaintenance() {
+                    homeWanted = false;
+                    removeCover("maintenance");
+                    hideNotice();
+                    pauseTakeovers();
+                    android.widget.Toast.makeText(OverlayService.this,
+                            "Maintenance: iFit screens allowed until you tap ⌂ Home",
+                            android.widget.Toast.LENGTH_LONG).show();
+                    HomeView.openIfitForMaintenance(OverlayService.this);
+                }
+            });
+            coverParams = new WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.OPAQUE);
+        }
+        Log.i(TAG, "cover up (iFit screen " + currentIfitScreen() + ")");
+        homeCover.reload();
+        windowManager.addView(homeCover, coverParams);
+        // Same window type: the last one added is on top, so lift the bar and track back above.
+        windowManager.removeView(bar);
+        windowManager.addView(bar, params);
+        windowManager.removeView(track);
+        windowManager.addView(track, trackParams);
+        coverShown = true;
+        hideNotice();
+    }
+
+    private void removeCover(String why) {
+        if (!coverShown) return;
+        Log.i(TAG, "cover down: " + why + " (iFit screen " + currentIfitScreen() + ", front " + foregroundPkg + ")");
+        windowManager.removeView(homeCover);
+        coverShown = false;
+    }
+
+    private String currentIfitScreen() {
+        synchronized (ifitLog) {
+            return ifitLog.screen() + (ifitLog.dialogShown() ? " + dialog" : "");
+        }
+    }
+
+    /**
+     * Main thread, once a second. While the home screen is wanted, keep the cover up when iFit
+     * would take Start; when it's stuck somewhere that won't (login, a dialog, results), step aside
+     * so it can be tapped, with a note in the bar. Another app coming to the front ends it.
+     */
+    private void updateCover(boolean ready) {
+        if (!homeWanted) return;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (takeoversPaused()) {
+            homeWanted = false;
+            removeCover("maintenance mode");
+            hideNotice();
+            return;
+        }
+        String fg = foregroundPkg;
+        if (now - homeShownAt > FOREGROUND_GRACE_MS && fg != null && !fg.startsWith("com.ifit.")
+                && !fg.equals(getPackageName()) && !fg.equals("android")) {
+            homeWanted = false; // something else came forward (a notification, Settings...)
+            removeCover("another app came forward");
+            hideNotice();
+            return;
+        }
+        if (ready) {
+            notReadySince = 0;
+            addCover();
+        } else if (notReadySince == 0) {
+            notReadySince = now;
+        } else if (now - notReadySince > NOT_READY_GRACE_MS && coverShown) {
+            Log.i(TAG, "iFit needs a tap; stepping aside");
+            removeCover("iFit needs a tap");
+            noticeText.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void hideNotice() {
+        if (noticeText != null) noticeText.setVisibility(View.GONE);
     }
 
     private void show(double kph, double incline, int seconds, double km) {
@@ -708,6 +872,9 @@ public class OverlayService extends Service {
         inclineUp = addControl("+", () -> stepIncline(+1));
         timeText = addStat(Color.rgb(170, 200, 255));
         distanceText = addStat(Color.rgb(140, 230, 160));
+        noticeText = addStat(Color.rgb(255, 170, 60));
+        noticeText.setText("iFit needs a tap");
+        noticeText.setVisibility(View.GONE);
         controlsToggle = addControl("±", () -> {
             if (controlsShown) hideControls();
             else showControls();
